@@ -58,6 +58,7 @@
         (vetsi rozliseni, mensi kolisani pri malem vykonu)
       - podpora ovladani jasu pro novou SMD verzi
   5.6 - autodetekce I2C adresy displeje
+  5.7 - hotplug displeje
 
 */
 #include <SoftEasyTransfer.h> //https://github.com/madsci1016/Arduino-SoftEasyTransfer
@@ -214,6 +215,35 @@ Modbus slave(nodeID, mySerial, TXenableRS485); // slave adresa,SoftwareSerial,RS
 // Nastav pro LCD piny PCF8574AT a I2C adresu 0x3f(PCF8574T 0x27)
 //                    addr, en,rw,rs,d4,d5,d6,d7,bl,blpol
 LiquidCrystal_I2C *lcd;
+int lcdAddr;
+
+void setBacklight(int8_t backlight) {
+  Wire.beginTransmission(0x25);
+  Wire.write(backlight);
+  Wire.endTransmission();
+  analogWrite(backlightPWMpin, ((10 - backlight) * 25) + 5);
+}
+
+int lcdCheck(int addr) {
+  if (addr == -1) return 0;
+  Wire.begin();
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission() == 0;
+}
+
+void lcdInit(int addr) {
+  lcdAddr = addr;
+  if (lcd) {
+    delete lcd;
+    lcd = NULL;
+  }
+  if (lcdAddr == -1) return;
+  lcd = new LiquidCrystal_I2C(lcdAddr, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);
+  lcd->begin(16, 2);
+  lcd->backlight();
+  lcd->createChar(1, stupen);
+  setBacklight(LCDbacklight);
+}
 
 //==============================================================================
 //=================================SETUP========================================
@@ -308,12 +338,12 @@ void setup() {
   slave.setID(nodeID);// nastavi Modbus slave adresu
   delay(60);
 
-  Wire.begin();
-  Wire.beginTransmission(0x27);
-  if (Wire.endTransmission() == 0)
-    lcd = new LiquidCrystal_I2C(0x27, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);
-  else
-    lcd = new LiquidCrystal_I2C(0x3F, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);
+  if (lcdCheck(0x27)) 
+    lcdInit(0x27); 
+  else {
+    lcdInit(0x3f);
+    if (!lcdCheck(0x3f)) lcdAddr = -1;
+  }
 
   lcd->begin(16, 2); // pocet znaku, pocet radku
   lcd->createChar(1, stupen); // ulozi do LCD symbol stupnu
@@ -832,6 +862,14 @@ void zobrazeni()
   //wdt_reset();
   unsigned long currentMillis = millis();
   if ((unsigned long)(currentMillis - previousMillis) >= interval_LCD) {
+    if (!lcdCheck(lcdAddr)) {
+      if (lcdCheck(0x27))
+        lcdInit(0x27);
+      else if (lcdCheck(0x3f))
+        lcdInit(0x3f);
+      else
+        lcdAddr = -1;
+    }
 
     lcd->setCursor(0, 0);// sloupec, radek
     if (napeti < 100 && napeti > 9) lcd->print(" ");
@@ -860,15 +898,8 @@ void zobrazeni()
       if ((int)(strida / 2.5) < 10) lcd->print(" ");
       lcd->print((int)(strida / 2.5));
       lcd->print("%      ");
-      //odesle jas podsvetleni LCD na attinyx5
-      Wire.beginTransmission(AttinyAddress); // zacatek komunikace
-      Wire.write(10); // odesle hodnotu
-      Wire.endTransmission();  // stop komunikace
-
-      analogWrite(backlightPWMpin, ((10 - LCDbacklight) * 25) + 5);   // PWM 0-255, urovne podsviceni 0-10 => *25
-
-    }
-    else {
+      setBacklight(LCDbacklight);
+    } else {
       lcd->setCursor(0, 1);
       if (vyroba < 10000000) lcd->print(" ");
       if (vyroba < 1000000) lcd->print(" ");
@@ -894,16 +925,8 @@ void zobrazeni()
       }
       lcd->write(1);
       lcd->print("C");
-
-      //odesle jas podsvetleni LCD na attinyx5
-      Wire.beginTransmission(AttinyAddress); // zacatek komunikace
-      Wire.write(LCDbacklight);    // odesle hodnotu
-      Wire.endTransmission();    // stop komunikace
-
-      analogWrite(backlightPWMpin, ((10 - LCDbacklight) * 25) + 5);   // PWM 0-255, urovne podsviceni 0-10 => *25, inverzne
-
+      setBacklight(LCDbacklight);
     }
-
     previousMillis = currentMillis;
   }
 }
@@ -1446,13 +1469,7 @@ char PollKey() {
       rizeni();
     }
     set_PWM(strida);
-    //odesle jas podsvetleni LCD na attinyx5
-    Wire.beginTransmission(AttinyAddress); // zacatek komunikace
-    Wire.write(LCDbacklight);    // odesle hodnotu
-    Wire.endTransmission();  // stop komunikace
-
-    analogWrite(backlightPWMpin, ((10 - LCDbacklight) * 25) + 5);   // PWM 0-255, urovne podsviceni 0-10 => *25, inverzne
-
+    setBacklight(LCDbacklight);
     //pri necinnosti v menu zped na hlavni obrazovku
     if (millis() > (menuTime + menuTimeExit)) {
       showStatus = false;
