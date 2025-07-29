@@ -59,13 +59,19 @@
       - podpora ovladani jasu pro novou SMD verzi
   5.6 - autodetekce I2C adresy displeje
   5.7 - hotplug displeje
-
+  5.8 - dalsi optimalizace MPPT algoritmu
+      - moznost vycitani stridy v Modbus registru 8
+      - moznost vycitani VA-krivek pres Modbus
+      - odstraneni delay() z hlavni smycky,
+        s tim souvisejici uprava funkce obsluhujici tlacitka
+      - optimalizace mereni, zvyseni rozliseni proudu
+      - odstraneni EEPROMAnything.h (EEPROM.h umi totez)
 */
+
 #include <SoftEasyTransfer.h> //https://github.com/madsci1016/Arduino-SoftEasyTransfer
 #include <SoftwareSerial.h>
 #include <ModbusRtu.h> //https://github.com/smarmengol/Modbus-Master-Slave-for-Arduino
 #include <EEPROM.h>
-#include "EEPROMAnything.h" //https://github.com/collin80/EEPROMAnything
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <avr/wdt.h>
@@ -73,16 +79,12 @@
 SoftwareSerial mySerial(8, 6); //Arduino RX - RS485 RO, Arduino TX - RS485 DI
 #define TXenableRS485 7 //RE + DE
 #define Buttons  A3 //pripojene tlacitka
-#define KeyExit  20 //nepouzito
-#define KeyUp    30 //nahoru	
-#define KeyDown  40 //dolu
-#define KeySel   50 //stisknuta obe tlacitka
-#define KeyInv   60 //neplatna hodnota tlacitka
 #define menuTimeExit 10000 //po case ukonci Menu
 #define pinA A1 //pin mereni proudu FV
 #define pinV A2 //pin mereni napeti FV
 #define cidlo_B A0 //cidlo teploty KTY81/210
-#define R25 2000 //referencni odpor termocidla pri 25st C
+#define R25 2000.0 //referencni odpor termocidla pri 25st C
+#define RDIV 2200.0 // hodnota rezistoru v delici s termocidlem
 #define mppt_pin 5 //jumper rezerva 
 #define enable_pin 4 // pin povoleni provozu menice
 #define backlightPWMpin  3 // Pin D3
@@ -97,27 +99,36 @@ SoftwareSerial mySerial(8, 6); //Arduino RX - RS485 RO, Arduino TX - RS485 DI
 #define runLED 1  // signalizacni LED behu
 #define I2C_Address 0x27 // adresa I2C prevodniku PCF8574T,PCF8574P; 0x27 (PCF8574AT; 0x3f)
 #define AttinyAddress 0x25 // adresa Attiny desky LCD
-#define VCC 5000 // napajeci napeti v mV pro vypocty
-int R = 2200; // hodnota rezistoru v delici s termocidlem
-int TeplBojl; //skutecna teplota bojleru (TUV)
 byte stupen[8] = {0b01100, 0b10010, 0b10010, 0b01100, 0b00000, 0b00000, 0b00000, 0b00000};
 int klavesa;
-byte offset, whichkey;
+uint8_t offset, whichkey;
 bool showStatus = false; //
 int nodeID = 12; // cislo Emon nodu
-int interval_LCD = 800; //cas obnoveni LCD
-unsigned long interval_VA =  60000; //interval kontroly VA krivky
-unsigned long interval_WR = 3600000; //interval zapisu vyroby - 60 min.
-int rucTimeExit = 10000; //cas prepnuti z rucniho zpet do aut. rezimu v ms
-int perKomunikace = 3000; // perioda odesilani dat v ms
-unsigned long currentMillis = 0;
-unsigned long previousMillis = 0;
-unsigned long previousVA = 0;
-unsigned long previousWR = 0;
-unsigned long casKomunikace;
-unsigned long casLED;
-unsigned long rucTime;
-unsigned long vyrobaTime = 0;
+#define INTERVAL_LCD 800 //cas obnoveni LCD
+#define INTERVAL_VA 60000 //interval kontroly VA krivky
+#define INTERVAL_WR 3600000 //interval zapisu vyroby - 60 min.
+#define INTERVAL_RUC 10000 //cas prepnuti z rucniho zpet do aut. rezimu v ms
+#define INTERVAL_KOM 3000 // perioda odesilani dat v ms
+unsigned long timNow, timMppt, timKey, timVA, timWR, timRuc, timKom, timDisp, timLed, timVyroba;
+
+/// TLACITKA ///
+int keyNow, keyPrev, keyLast, keyState;
+enum { KEY_NONE, KEY_FIRST, KEY_REP, KEY_INVALID };
+enum { KeyInv, KeyExit, KeyUp, KeyDown, KeySel };
+
+/// MERENI ///
+float fNapeti, fProud, fVykon;
+float veff, veff_prev;
+int napeti, proud, vykon, vykon_prev;
+int TeplBojl; //skutecna teplota bojleru (TUV)
+#define NSAMPLES 64 // pocet vzorku mereni (64 -> perioda hlavni smycky cca 30ms)
+#define VCC 5000.0 // napajeci napeti v mV pro vypocty
+#define ADCMAX 1023.0 // maximalni hodnota ADC odpovidajici napajecimu napeti
+const float koefProud = VCC / ADCMAX / NSAMPLES; // 10mA/mV; LSB = 10mA
+const float koefNapeti = VCC / ADCMAX * (R1 + R2) / R2 / 1000 / NSAMPLES;
+float offsetA, rawProud;
+
+
 unsigned long vyroba = 0;
 unsigned long lastvyroba;
 float whInc2;
@@ -127,12 +138,8 @@ bool zapis;
 int strida = 8;
 long topv;
 int amp, nap, valA, valV;
-float vyk, vPow, Avolt;
-int napeti, proud, vykon;
-int offsetA = -32768;
-float veff, veff_prev;
+float vyk;
 byte restart = 0;
-int cnt = 200; //pocet vzorku mereni
 int smer = 1; //smer zmeny stridy 1 = zvysovani 2 = snizovani
 bool rucne = false; //rezim rizeni
 int addr_vyroba = 45;
@@ -143,9 +150,9 @@ unsigned long FirstRun;// hodnota kontroly prvniho spusteni programu
 unsigned long menuTime = 0;
 unsigned long hodnotaL;
 int teplotaMax = 90; //max teplota
-int vykonMax = 2800; //max vykon
+int vykonMax = 2800, vykonMaxSts; //max vykon
 int veffMax = 260; // max efektivni vystupni napeti
-int timeTestMPPT = 20; //perioda kontroly krivky MPPT
+uint16_t timeTestMPPT = 20; //perioda kontroly krivky MPPT
 int onVA = 1; // kontrola VA krivky aktivni
 int maxV = 0; //max. namerene napeti
 int maxA = 0; //max. namereny proud
@@ -167,7 +174,7 @@ const char string_6[] PROGMEM =   "Kalibrace V"; //5
 const char string_7[] PROGMEM =   "Kalibrace A"; //6
 const char string_8[] PROGMEM =   "Komunikace"; //7
 const char string_9[] PROGMEM =   "Podsviceni LCD"; //8
-const char string_10[] PROGMEM =   "Max. hodnoty"; //9
+const char string_10[] PROGMEM =  "Max. hodnoty"; //9
 const char string_11[] PROGMEM =  "Tovarni RESET"; //10 rezerva
 const char string_12[] PROGMEM =  " "; //11 rezerva
 const char string_13[] PROGMEM =  "  *NASTAVENI*   "; //12
@@ -205,10 +212,7 @@ PayloadTX emontx;   // vytvoreni instance
 SoftEasyTransfer ET;
 
 // pole dat pro modbus
-unsigned int holdingdata[20] = {
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-};
+unsigned int holdingdata[200];
 unsigned int cnt_sl;
 Modbus slave(nodeID, mySerial, TXenableRS485); // slave adresa,SoftwareSerial,RS485 enable pin
 
@@ -233,12 +237,12 @@ int lcdCheck(int addr) {
 
 void lcdInit(int addr) {
   lcdAddr = addr;
-  if (lcd) {
-    delete lcd;
-    lcd = NULL;
-  }
   if (lcdAddr == -1) return;
-  lcd = new LiquidCrystal_I2C(lcdAddr, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);
+  if (lcd) {
+    lcd->config(lcdAddr, 2, 1, 0, 4, 5, 6, 7);
+  } else {
+    lcd = new LiquidCrystal_I2C(lcdAddr, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);
+  }
   lcd->begin(16, 2);
   lcd->backlight();
   lcd->createChar(1, stupen);
@@ -271,54 +275,54 @@ void setup() {
   // Zapis vychozich hodnot do Eeprom pri prvnim spusteni programu.
 
   //nacte kontrolni hodnotu z konce Eeprom
-  EEPROM_readAnything(1020, FirstRun);
+  EEPROM.get(1020, FirstRun);
 
   //pokud hodnota nesouhlasi provede se prvotni inicializace Eeprom
   if (!(FirstRun == 0x710812AA))
   {
-    EEPROM_writeAnything(2, addr_vyroba);// int
-    EEPROM_writeAnything(6, addr_suma_write);// int
-    EEPROM_writeAnything(8, PreviousWrite);// long
-    EEPROM_writeAnything(12, nodeID);// int
-    EEPROM_writeAnything(14, teplotaMax);// int
-    EEPROM_writeAnything(16, vykonMax);// int
-    EEPROM_writeAnything(18, timeTestMPPT);// int
-    EEPROM_writeAnything(20, onVA);// int
-    EEPROM_writeAnything(22, maxV);// int
-    EEPROM_writeAnything(24, maxA);// int
-    EEPROM_writeAnything(26, maxW);// int
-    EEPROM_writeAnything(28, kalibV);// int
-    EEPROM_writeAnything(30, kalibA);// int
-    EEPROM_writeAnything(32, KomTyp);// int
-    EEPROM_writeAnything(34, LCDbacklight);// int
-    EEPROM_writeAnything(36, veffMax);
-    EEPROM_writeAnything(addr_vyroba, vyroba);
-    EEPROM_writeAnything(addr_suma_write, SumaWrite);
+    EEPROM.put(2, addr_vyroba);// int
+    EEPROM.put(6, addr_suma_write);// int
+    EEPROM.put(8, PreviousWrite);// long
+    EEPROM.put(12, nodeID);// int
+    EEPROM.put(14, teplotaMax);// int
+    EEPROM.put(16, vykonMax);// int
+    EEPROM.put(18, timeTestMPPT);// int
+    EEPROM.put(20, onVA);// int
+    EEPROM.put(22, maxV);// int
+    EEPROM.put(24, maxA);// int
+    EEPROM.put(26, maxW);// int
+    EEPROM.put(28, kalibV);// int
+    EEPROM.put(30, kalibA);// int
+    EEPROM.put(32, KomTyp);// int
+    EEPROM.put(34, LCDbacklight);// int
+    EEPROM.put(36, veffMax);
+    EEPROM.put(addr_vyroba, vyroba);
+    EEPROM.put(addr_suma_write, SumaWrite);
     //zapise kontrolni hodnotu o provedene prvotni inicializaci
     FirstRun = 0x710812AA;
-    EEPROM_writeAnything(1020, FirstRun);
+    EEPROM.put(1020, FirstRun);
   }
 
   //==============================================================================
 
-  EEPROM_readAnything(2, addr_vyroba); //adresa pro nacteni sumy vyroby
-  EEPROM_readAnything(6, addr_suma_write); //adresa pro nacteni sumy zapisu do EEPROM
-  EEPROM_readAnything(8, PreviousWrite); //predchozi hodnota poctu zapisu do EEPROM
-  EEPROM_readAnything(12, nodeID);// int
-  EEPROM_readAnything(14, teplotaMax);// int
-  EEPROM_readAnything(16, vykonMax);// int
-  EEPROM_readAnything(18, timeTestMPPT);// int
-  EEPROM_readAnything(20, onVA);// int
-  EEPROM_readAnything(22, maxV);// int
-  EEPROM_readAnything(24, maxA);// int
-  EEPROM_readAnything(26, maxW);// int
-  EEPROM_readAnything(28, kalibV);// int
-  EEPROM_readAnything(30, kalibA);// int
-  EEPROM_readAnything(32, KomTyp);// int
-  EEPROM_readAnything(34, LCDbacklight);// int
-  EEPROM_readAnything(36, veffMax);
-  EEPROM_readAnything(addr_vyroba, vyroba); //nacteni vyroby z aktualni adresy
-  EEPROM_readAnything(addr_suma_write, SumaWrite);// nacteni sumy zapisu z akt. adresy
+  EEPROM.get(2, addr_vyroba); //adresa pro nacteni sumy vyroby
+  EEPROM.get(6, addr_suma_write); //adresa pro nacteni sumy zapisu do EEPROM
+  EEPROM.get(8, PreviousWrite); //predchozi hodnota poctu zapisu do EEPROM
+  EEPROM.get(12, nodeID);// int
+  EEPROM.get(14, teplotaMax);// int
+  EEPROM.get(16, vykonMax);// int
+  EEPROM.get(18, timeTestMPPT);// int
+  EEPROM.get(20, onVA);// int
+  EEPROM.get(22, maxV);// int
+  EEPROM.get(24, maxA);// int
+  EEPROM.get(26, maxW);// int
+  EEPROM.get(28, kalibV);// int
+  EEPROM.get(30, kalibA);// int
+  EEPROM.get(32, KomTyp);// int
+  EEPROM.get(34, LCDbacklight);// int
+  EEPROM.get(36, veffMax);
+  EEPROM.get(addr_vyroba, vyroba); //nacteni vyroby z aktualni adresy
+  EEPROM.get(addr_suma_write, SumaWrite);// nacteni sumy zapisu z akt. adresy
   lastvyroba = vyroba;
 
   pinMode(ochrana_pin, INPUT); //vstup stavu nadproudove ochrany
@@ -374,13 +378,14 @@ void setup() {
   wdt_reset(); //reset watchdogu
   lcd->clear();
   lcd->setCursor(0, 0);
-  lcd->print(" fork24 v5.6    ");
+  lcd->print(" fork24 v5.8    ");
   lcd->setCursor(0, 1);
-  lcd->print(" JS 11/2024     ");
+  lcd->print(" JS 07/2025     ");
   delay(2000);
 
   // nastavit offsetA
   mereni();
+  offsetA = rawProud;
 
   //-----------------reset nadproudove ochrany----------------------------------
   digitalWrite(ochrana_reset_pin, HIGH);
@@ -397,12 +402,11 @@ void setup() {
 void loop() {
 
   mereni(); // mereni hodnot
-  if ((digitalRead(enable_pin)) || (TeplBojl >= teplotaMax)) strida = 0; // provoz menice neni povolen, nastav stridu na 0
-
-  else
-  {
+  if ((digitalRead(enable_pin)) || (TeplBojl >= teplotaMax))
+    strida = 0; // provoz menice neni povolen, nastav stridu na 0
+  else {
     rizeni(); // MPPT rizeni
-    testVA (); //test VA krivky
+    if (!vykonMaxSts) testVA(); // test VA krivky, vynechat pokud jsme blizko max. vykonu
 
     //------------------pusobeni nadproudove ochrany---------------------------------
 
@@ -445,28 +449,26 @@ void loop() {
   }
   //------------------------------------------------------------------------------
   set_PWM(strida);
-  delay(10);//
   zobrazeni();
-  if (!rucne) delay(100); // zpozdeni pokud neni rucni rezim
   komunikace();
   //------------------------------------------------------------------------------
   // zapis vyroby do EEprom po 60 min.
-  currentMillis = millis();
-  if ((unsigned long)(currentMillis - previousWR) >= interval_WR)
+  timNow = millis();
+  if (timNow - timWR >= INTERVAL_WR)
   {
     zapis = true; //
-    previousWR = currentMillis;
+    timWR = timNow;
   }
   //-----------------------------------------------------------------------------
   // signalizace behu programu
-  currentMillis = millis();
-  if ((unsigned long)(currentMillis - casLED) >= 1000)
+  timNow = millis();
+  if (timNow - timLed >= 1000)
   {
     digitalWrite(runLED, LOW);
     delay(30);
     digitalWrite(runLED, HIGH);
 
-    casLED = currentMillis;
+    timLed = timNow;
   }
 
   //--------------------------------Zapis do EEPROM------------------------------
@@ -474,22 +476,22 @@ void loop() {
   //  posun adresy po 90000 zapisech
   if (zapis)
   {
-    EEPROM_writeAnything(addr_vyroba, vyroba); //uloz vyrobu
+    EEPROM.put(addr_vyroba, vyroba); //uloz vyrobu
     SumaWrite++;
     zapis = false;
-    EEPROM_writeAnything(addr_suma_write, SumaWrite); //uloz celkovy pocet zapisu
+    EEPROM.put(addr_suma_write, SumaWrite); //uloz celkovy pocet zapisu
     // pokud pocet zapisu do jedne bunky presahl 90000 posun se na dalsi
     if ((SumaWrite - PreviousWrite) >= 90000)
     {
       addr_vyroba += 10; // posun adresy pro zapis o 10
       addr_suma_write += 10;
       // zapis aktualnich hodnot do EEPROM
-      EEPROM_writeAnything(2, addr_vyroba); //uloz akt. adresu vyroby
-      EEPROM_writeAnything(6, addr_suma_write); //uloz akt. adresu sumy zapisu
+      EEPROM.put(2, addr_vyroba); //uloz akt. adresu vyroby
+      EEPROM.put(6, addr_suma_write); //uloz akt. adresu sumy zapisu
       PreviousWrite = SumaWrite;
-      EEPROM_writeAnything(8, PreviousWrite);
-      EEPROM_writeAnything(addr_vyroba, vyroba);
-      EEPROM_writeAnything(addr_suma_write, SumaWrite);
+      EEPROM.put(8, PreviousWrite);
+      EEPROM.put(addr_vyroba, vyroba);
+      EEPROM.put(addr_suma_write, SumaWrite);
     }
   }
 
@@ -503,19 +505,17 @@ void loop() {
 
     if (klavesa == KeyUp)
     {
-      strida++;
+      strida += 5;
       rucne = true; //po stisku tlacitka rezim zmeny stridy rucne
-      rucTime = millis();
-      delay(15);
+      timRuc = millis();
     }
     if (strida > maxStrida) strida = maxStrida;
 
     if (klavesa == KeyDown)
     {
-      strida--;
+      strida -= 5;
       rucne = true; //po stisku tlacitka rezim zmeny stridy rucne
-      rucTime = millis();
-      delay(15);
+      timRuc = millis();
     }
     if (strida < 8) strida = 8;
 
@@ -530,8 +530,8 @@ void loop() {
 void komunikace()
 {
   if (KomTyp) {
-    currentMillis = millis();
-    if ((unsigned long)(currentMillis - casKomunikace >= perKomunikace))
+    timNow = millis();
+    if (timNow - timKom >= INTERVAL_KOM)
     {
       //EasyTransfer
       // naplneni struktury dat
@@ -550,10 +550,9 @@ void komunikace()
       digitalWrite(TXenableRS485, LOW);
       delay(20);
       digitalWrite(LEDpin, LOW); // activity LED
-      casKomunikace = currentMillis;
+      timKom = timNow;
     }
-  }
-  else {
+  } else {
     //Modbus RTU
     unsigned int HighINT;
     unsigned int LowINT;
@@ -565,7 +564,7 @@ void komunikace()
     holdingdata[5] = proud;
     holdingdata[6] = vykon;
     holdingdata[7] = TeplBojl;
-    holdingdata[8] = 0;
+    holdingdata[8] = strida;
     holdingdata[9] = 0;
     holdingdata[10] = 0;
     holdingdata[11] = 0;
@@ -573,18 +572,16 @@ void komunikace()
     HighINT = vyroba >> 16 & 0x0000ffffl ;//vyroba;
     LowINT = vyroba & 0x0000ffffl;
 
-
     holdingdata[12] = LowINT; //vyroba LO
     holdingdata[13] = HighINT; //vyroba HI
     holdingdata[14] = 0;
     holdingdata[15] = 0;
     holdingdata[16] = 0;
     holdingdata[17] = 0;
-    holdingdata[18] = 0;
+    holdingdata[18] = vykonMaxSts;
     holdingdata[19] = offsetA;
 
-
-    slave.poll( holdingdata, 20 );
+    slave.poll( holdingdata, 200 );
 
     if (cnt_sl != slave.getOutCnt()) {
       digitalWrite(LEDpin, HIGH);
@@ -634,81 +631,67 @@ void set_PWM(int dutyCycle)
 //prevod potrebnych hodnot do int
 void mereni()
 {
+  uint32_t sumV = 0;
+  int32_t sumA = 0;
+  uint32_t sumT = 0;
+
+
   wdt_reset();
-  vPow = VCC / 1000.0;
 
-  unsigned long totV = 0;
-  unsigned long totA = 0;
-  unsigned long totT = 0;
-  for (int i = 0; i < cnt; i++)
+  for (int i = 0; i < NSAMPLES; i++)
   {
-    totA = totA + analogRead(pinA); //zmer proud
-    totV = totV + analogRead(pinV); //zmer napeti
-    totT = totT + analogRead(cidlo_B);//teplota
+    sumA = sumA + analogRead(pinA) - 512; //zmer proud
+    sumV = sumV + analogRead(pinV); //zmer napeti
+    sumT = sumT + analogRead(cidlo_B);//teplota
   }
-  amp = totA / cnt; // prumer ze vzorku
-  nap = totV / cnt;
-  totT = totT / cnt;
+
   // vypocet proudu
-  Avolt = amp * (VCC / 1024.0);
-  Avolt = (Avolt - (VCC / 2)); // 0856 = 8,56A
-  //Avolt = 9;//###DEBUG###
-  Avolt = Avolt + ((Avolt / 100) * (kalibA / 10)); //kalibrace hodnoty proudu
-  proud = (int) Avolt;
+  rawProud = koefProud * sumA;
+  fProud = (rawProud - offsetA) * (1 + 0.001 * kalibA);
+  proud = fProud;
 
-  // offset nuloveho proudu ACS712
-  if (offsetA == -32768)
-    offsetA = proud;
-  proud -= offsetA;
-
-  //proud = 920; //###DEBUG###
   if (proud <= 9) proud = 0;//kalibrace 0
-  //-------------------------------------------
-  if (proud >= Maxproud) {
-    nadproud = true; //omezeni trvaleho proudu
+  nadproud = proud >= Maxproud;
 
-  }
-  else {
-    nadproud = false;
-  }
-  //---------------------------------------------
-  if (!digitalRead (ochrana_pin)) ochrana = true;// pri aktivni nadproudove ochrane nastav priznak
-  float a = proud;
-  float v = (nap * vPow) / 1024.0;
-  float v2 = v / (R2 / (R1 + R2)); //vypocet napeti podle delice
-  v2 = v2 + ((v2 / 100) * (kalibV / 10)); //kalbrace napeti
-  //v2 = 289;//###DEBUG###
+  // vypocet napeti
+  fNapeti = (koefNapeti * sumV) * (1 + 0.001 * kalibV);
+  napeti = fNapeti;
 
-  napeti = (int) v2;
-  vyk = (v2 * a) / 100; //vypocet vykonu
-  vykon = (int)vyk; //okamzity vykon
+  // vypocet teploty
+  if (sumT > 1020L * NSAMPLES) // pokud je odpojené termočidlo nastav 0 oC
+  {
+    sumT = 437 * NSAMPLES;
+  }
+  TeplBojl = vypocet(sumT); //vypocet teploty
+
+  // vypocet vykonu
+  fVykon = fNapeti * fProud * 0.01; //okamzity vykon
+  vykon = fVykon;
+
+  // vypocet efektivni hodnoty napeti
+  veff = sqrt(fNapeti * fNapeti * strida * 0.004);
+
+  // maximalni hodnoty
   if (napeti > maxV) {
     maxV = napeti;
-    EEPROM_writeAnything(22, maxV);//
+    EEPROM.put(22, maxV);//
   }
   if (proud > maxA) {
     maxA = proud;
-    EEPROM_writeAnything(24, maxA);//
+    EEPROM.put(24, maxA);//
   }
   if (vykon > maxW) {
     maxW = vykon;
-    EEPROM_writeAnything(26, maxW);//
-  }
-  //vykon = 3500;//###DEBUG###
-  if (totT > 1020) // pokud je odpojené termočidlo nastav 0 oC
-  {
-    totT = 437;
+    EEPROM.put(26, maxW);//
   }
 
-  veff = sqrt((int32_t) napeti * napeti * strida / 250);
-
-  TeplBojl = vypocet(totT); //vypocet teploty
-
+  //---------------------------------------------
+  if (!digitalRead (ochrana_pin)) ochrana = true;// pri aktivni nadproudove ochrane nastav priznak
 
   //=====================Vypocet vyroby Wh====================================
-  unsigned long lvyrobaTime = vyrobaTime;
-  vyrobaTime = millis();
-  float whInc = vykon * ((vyrobaTime - lvyrobaTime) / 3600000.0);
+  unsigned long ltimVyroba = timVyroba;
+  timVyroba = millis();
+  float whInc = fVykon * ((timVyroba - ltimVyroba) / 3600000.0);
   whInc2 = whInc2 + whInc;
   if (whInc2 > 1.0)
   {
@@ -729,20 +712,14 @@ void mereni()
 }
 //============================================================================
 // vypocte z analogove hodnoty teplotu
-int vypocet(int value) {
-  float ukty = value * ( vPow / 1024.0 ) ; //vypocet napeti na senzoru
-  // alfa x R25
+int16_t vypocet(uint32_t value) {
+  float fAdc = value / NSAMPLES;
+
   float a = 0.007874 * R25;
-  // beta x R25
   float b = 0.00001874 * R25;
-  // koeficient c
-  float c = R25 - R * ukty / (vPow - ukty);
-  float delta = a * a - 4 * b * c;
-  float delta1 = sqrt (delta);
-  float x2 = (-a + delta1) / (2 * b);
-  float temp1 = x2 + 25 ;
-  int teplota = temp1;//prevod na int
-  return teplota;
+  float c = R25 - RDIV * fAdc / (ADCMAX - fAdc);
+  float d = sqrt(a * a - 4 * b * c);
+  return (int16_t) ((d - a) / (2 * b) + 25);
 }
 
 //==========================Rizeni vykonu MPPT==================================
@@ -750,8 +727,9 @@ int vypocet(int value) {
 //hledani max. vykonu fotovoltaickych panelu
 void rizeni()
 {
-  currentMillis = millis();
-  if ((unsigned long)(currentMillis > (rucTime + rucTimeExit))) rucne = false;
+  timNow = millis();
+  if (timNow - timRuc >= INTERVAL_RUC) rucne = false;
+
 
   if (rucne == false)
   {
@@ -769,14 +747,15 @@ void rizeni()
         smer = 1;
       }
       smer = 2;
-    }
-    else {
+      vykonMaxSts = 10;
+    } else if (timNow - timMppt > 500) {
+      timMppt = timNow;
       //xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
       //smer nahoru
       switch (smer) {
         case 1:
           {
-            if (veff >= veff_prev) {
+            if (veff >= veff_prev || vykon >= vykon_prev) {
               strida++; //pokud se vykon zvysuje pri smeru nahoru zvys stridu
               if (strida > maxStrida) {
                 strida = maxStrida;
@@ -790,7 +769,7 @@ void rizeni()
         //smer dolu
         case 2:
           {
-            if (veff >= veff_prev && vykon > 0) {
+            if ((veff >= veff_prev || vykon >= vykon_prev) && vykon > 0) {
               strida--; //pokud se vykon zvysuje pri smeru dolu sniz stridu
               if (strida < 5) {
                 strida = 5;
@@ -802,6 +781,8 @@ void rizeni()
           }
       }
       veff_prev = veff;
+      vykon_prev = vykon;
+      if (vykonMaxSts) vykonMaxSts--;
     }
   }
 }
@@ -812,22 +793,28 @@ void rizeni()
 //nastavi stridu na tuto novou hodnotu
 void testVA ()
 {
+  int regIdx;
+
   if (onVA)
   {
     // povolen test VA krivky
-    currentMillis = millis();
-    if ((unsigned long)(currentMillis - previousVA) >= (interval_VA * timeTestMPPT) && (strida > 50 && strida < 185) && (!rucne))
+    timNow = millis();
+    if ((timNow - timVA >= INTERVAL_VA * timeTestMPPT) &&
+//      (strida > 50 && strida < 185) &&
+      (!rucne))
     {
       //kontrola VA krivky pokud ubehl nastaveny interval
       //neni ruc. rezim a strida je mezi 50 a 185
-      int MAX_vykon = 0;
-      int MAX_strida = 0;
+      int vykonMpp = 0;
+      int veffMpp = 0;
+      int stridaMpp = 0;
       vykon = 0;
       lcd->clear();
       lcd->setCursor(0, 0);// sloupec, radek
       lcd->print("   Test MPPT    ");
       int m = 10;
-      while ((m < maxStrida) && (vykon < vykonMax) && veff < veffMax)
+      regIdx = 0;
+      while (m < maxStrida && vykon < vykonMax && veff < veffMax)
       {
         strida = m;
         set_PWM(strida);
@@ -836,21 +823,38 @@ void testVA ()
         lcd->print((int)(strida / 2.5));
         lcd->print("% ");
         //lcd->print(m);
-        delay(10);
+        if (strida == 10)
+          delay(400); // cas na nabiti kondenzatoru
+        else
+          delay(100);
         mereni();
-        if (vykon > MAX_vykon)
+        if (vykon > vykonMpp && veff > veffMpp)
         {
-          MAX_vykon = vykon;
-          MAX_strida = strida;
+          vykonMpp = vykon;
+          veffMpp = veff;
+          stridaMpp = strida;
+        }
+        if (regIdx < 48) {
+          holdingdata[regIdx * 2 + 21] = napeti;
+          holdingdata[regIdx * 2 + 22] = proud;
         }
         m += 5;
+        regIdx++;
       }
-      vykon = MAX_vykon;
-      strida = MAX_strida;
-      delay(500);
-      previousVA = currentMillis;
+      vykon = vykonMpp;
+      veff = veffMpp;
+      strida = stridaMpp;
+      while (regIdx < 48) { // pokud byl prekrocen max. vykon, doplnit krivku nulami
+          holdingdata[regIdx * 2 + 21] = 0;
+          holdingdata[regIdx * 2 + 22] = 0;
+          regIdx++;
+      }
+      if (holdingdata[20] < 100)
+        holdingdata[20]++;
+      else
+        holdingdata[20] = 1;
+      timVA = timNow;
     }
-
   }
 }
 
@@ -860,8 +864,8 @@ void testVA ()
 void zobrazeni()
 {
   //wdt_reset();
-  unsigned long currentMillis = millis();
-  if ((unsigned long)(currentMillis - previousMillis) >= interval_LCD) {
+  unsigned long timNow = millis();
+  if (timNow - timDisp >= INTERVAL_LCD) {
     if (!lcdCheck(lcdAddr)) {
       if (lcdCheck(0x27))
         lcdInit(0x27);
@@ -927,7 +931,7 @@ void zobrazeni()
       lcd->print("C");
       setBacklight(LCDbacklight);
     }
-    previousMillis = currentMillis;
+    timDisp = timNow;
   }
 }
 
@@ -980,7 +984,7 @@ void nastaveni_kwh() {
       case KeySel: // uloz nastavenou vyrobu
         vyroba = hodnotaL;
         lcd->noBlink();
-        EEPROM_writeAnything(addr_vyroba, vyroba); //uloz do eeprom
+        EEPROM.put(addr_vyroba, vyroba); //uloz do eeprom
         ulozeno(); break;
 
     }
@@ -1029,7 +1033,6 @@ void mainMenu() {
     switch (whichkey) {
 
       case KeyUp:
-        if (offset >= 0) offset++;
         if (offset > 11) offset = 0;
         break;
 
@@ -1098,7 +1101,7 @@ void menu_zmenaID() {
       case KeyDown:
         nodeID = hodnota;
         slave.setID(nodeID);// nastavi Modbus slave adresu
-        EEPROM_writeAnything(12, nodeID); //uloz do eeprom
+        EEPROM.put(12, nodeID); //uloz do eeprom
         ulozeno(); break;
     }
   } while (showStatus);
@@ -1125,7 +1128,7 @@ void menu_Mteplota() {
         break;
       case KeyDown:
         teplotaMax = hodnota;
-        EEPROM_writeAnything(14, teplotaMax); //uloz do eeprom
+        EEPROM.put(14, teplotaMax); //uloz do eeprom
         ulozeno(); break;
     }
   } while (showStatus);
@@ -1148,7 +1151,7 @@ void menu_Mvykon() {
         break;
       case KeyDown:
         vykonMax = hodnota;
-        EEPROM_writeAnything(16, vykonMax); //uloz do eeprom
+        EEPROM.put(16, vykonMax); //uloz do eeprom
         ulozeno(); break;
     }
   } while (showStatus);
@@ -1171,7 +1174,7 @@ void menu_Mveff() {
         break;
       case KeyDown:
         veffMax = hodnota;
-        EEPROM_writeAnything(36, veffMax); //uloz do eeprom
+        EEPROM.put(36, veffMax); //uloz do eeprom
         ulozeno(); break;
     }
   } while (showStatus);
@@ -1202,9 +1205,9 @@ void menu_maxHodnoty() {
         maxV = 0;
         maxA = 0;
         maxW = 0;
-        EEPROM_writeAnything(22, maxV);// int
-        EEPROM_writeAnything(24, maxA);// int
-        EEPROM_writeAnything(26, maxW);// int
+        EEPROM.put(22, maxV);// int
+        EEPROM.put(24, maxA);// int
+        EEPROM.put(26, maxW);// int
         break;
       case KeyDown:
         showStatus = false;
@@ -1236,9 +1239,9 @@ void menu_perVA() {
         timeTestMPPT = hodnota;
         if (timeTestMPPT == 0) onVA = 0;
         else onVA = 1;
-        EEPROM_writeAnything(20, onVA); //uloz do eeprom
+        EEPROM.put(20, onVA); //uloz do eeprom
 
-        EEPROM_writeAnything(18, timeTestMPPT);//uloz do eeprom
+        EEPROM.put(18, timeTestMPPT);//uloz do eeprom
         ulozeno(); break;
     }
   } while (showStatus);
@@ -1268,7 +1271,7 @@ void menu_kalibraceV() {
         break;
       case KeyDown:
         kalibV = hodnota;
-        EEPROM_writeAnything(28, kalibV); //uloz do eeprom
+        EEPROM.put(28, kalibV); //uloz do eeprom
         ulozeno(); break;
     }
   } while (showStatus);
@@ -1298,7 +1301,7 @@ void menu_kalibraceA() {
         break;
       case KeyDown:
         kalibA = hodnota;
-        EEPROM_writeAnything(30, kalibA); //uloz do eeprom
+        EEPROM.put(30, kalibA); //uloz do eeprom
         ulozeno(); break;
     }
   } while (showStatus);
@@ -1323,7 +1326,7 @@ void menu_komunikace() {
         break;
       case KeyDown:
         KomTyp = hodnota;
-        EEPROM_writeAnything(32, KomTyp); //uloz do eeprom
+        EEPROM.put(32, KomTyp); //uloz do eeprom
         ulozeno(); break;
     }
   } while (showStatus);
@@ -1349,7 +1352,7 @@ void menu_TovReset() {
         showStatus = false;
         if (hodnota == 0) {
           FirstRun = 0x00000000; //nastav odlisnou hodnotu
-          EEPROM_writeAnything(1020, FirstRun);
+          EEPROM.put(1020, FirstRun);
           wdt_enable(WDTO_1S); //zkraceni periody watchdogu
           delay(2000);// cekej na reset
         }
@@ -1364,7 +1367,7 @@ void menu_TovReset() {
 // nastaveni podsviceni
 void menu_LCDbacklight() {
 
-  EEPROM_readAnything(34, LCDbacklight);
+  EEPROM.get(34, LCDbacklight);
   int hodnota = LCDbacklight;
   do {
     lcd->clear();
@@ -1381,7 +1384,7 @@ void menu_LCDbacklight() {
       case KeyDown:
         LCDbacklight = hodnota;
         LCDbacklightLast = hodnota;
-        EEPROM_writeAnything(34, LCDbacklight); //uloz do eeprom
+        EEPROM.put(34, LCDbacklight); //uloz do eeprom
         ulozeno(); break;
     }
   } while (showStatus);
@@ -1433,23 +1436,42 @@ void PrintLCD_P(int which) {
 //kontroluje analog. hodnotu stisknuteho tlacitka
 
 char KeyScan() {
-  int which, which2, diff, retVal;
   wdt_reset();
-  which = analogRead(Buttons);
-  //lcd->setCursor(0, 0);// DEBUG
-  //lcd->print(which); // DEBUG
-  delay(10);
-  which2 = analogRead(Buttons);
-  retVal = KeyInv;
-  diff = abs(which - which2);
-  if (diff < 12) {
 
-    if (which > 710 && which < 800) retVal = KeySel; // obe tlacitka
-    if (which > 600 && which < 700) retVal =  KeyUp; //tlac. nahoru
-    if (which > 400 && which < 550) retVal =  KeyDown; //tlac. dolu
-    if (which > 210 && which < 300) retVal =  KeyExit; // nepouzito
+  timNow = millis();
+  unsigned int adc = analogRead(Buttons);
+
+  keyNow = KeyInv;
+
+  if (adc > 710 && adc < 800) keyNow = KeySel; // obe tlacitka
+  if (adc > 600 && adc < 700) keyNow = KeyUp; // tlac. nahoru
+  if (adc > 400 && adc < 550) keyNow = KeyDown; // tlac. dolu
+  if (adc > 210 && adc < 300) keyNow = KeyExit; // nepouzito
+
+  if (keyNow != keyPrev) {
+    timKey = timNow;
+    keyPrev = keyNow;
+  } else if (keyNow == KeyInv && timNow - timKey > 200) { // neni stisknuto tlacitko - navrat do normalniho stavu
+    keyLast = KeyInv;
+    keyState = KEY_NONE;
+    timKey = timNow;
+  } else if (keyNow != KeyInv && keyState == KEY_NONE && timNow - timKey > 40) { // stisk tlacitka
+    keyLast = keyNow;
+    keyState = KEY_FIRST;
+    timKey = timNow;
+    return keyNow;
+  } else if (keyNow == keyLast && keyState == KEY_FIRST && timNow - timKey > 1000) { // podrzeni tlacitka - prvotni prodleva
+    keyState = KEY_REP;
+    timKey = timNow;
+    return keyNow;
+  } else if (keyNow == keyLast && keyState == KEY_REP && timNow - timKey > 400) { // podrzeni tlacitka - interval opakovani
+    timKey = timNow;
+    return keyNow;
+  } else {
+    if (keyNow != keyLast && keyState != KEY_NONE) // zmena stisknutych tlacitek - ignorovat
+      keyState = KEY_INVALID;
   }
-  return retVal;
+  return KeyInv;
 }
 
 //==================================================================
@@ -1471,7 +1493,7 @@ char PollKey() {
     set_PWM(strida);
     setBacklight(LCDbacklight);
     //pri necinnosti v menu zped na hlavni obrazovku
-    if (millis() > (menuTime + menuTimeExit)) {
+    if (millis() > menuTime + menuTimeExit) {
       showStatus = false;
     }
 
@@ -1480,4 +1502,3 @@ char PollKey() {
   delay(80);
   return Whichkey;
 }
-
