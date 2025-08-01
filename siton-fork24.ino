@@ -1033,6 +1033,7 @@ void mainMenu() {
     switch (whichkey) {
 
       case KeyUp:
+        if (offset >= 0) offset++;
         if (offset > 11) offset = 0;
         break;
 
