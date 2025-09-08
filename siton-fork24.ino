@@ -66,6 +66,8 @@
         s tim souvisejici uprava funkce obsluhujici tlacitka
       - optimalizace mereni, zvyseni rozliseni proudu
       - odstraneni EEPROMAnything.h (EEPROM.h umi totez)
+  5.9 - BUGFIX: nefunkcni nastaveni kWh po zapnuti
+      - indikace "STOP E" / "STOP T" jako ve verzi 8.x
 */
 
 #include <SoftEasyTransfer.h> //https://github.com/madsci1016/Arduino-SoftEasyTransfer
@@ -109,7 +111,8 @@ int nodeID = 12; // cislo Emon nodu
 #define INTERVAL_WR 3600000 //interval zapisu vyroby - 60 min.
 #define INTERVAL_RUC 10000 //cas prepnuti z rucniho zpet do aut. rezimu v ms
 #define INTERVAL_KOM 3000 // perioda odesilani dat v ms
-unsigned long timNow, timMppt, timKey, timVA, timWR, timRuc, timKom, timDisp, timLed, timVyroba;
+unsigned long timNow, timMppt, timKey, timVA, timWR, timRuc, timKom, timDisp, timLed, timVyroba, timStart;
+int keyUpCnt;
 
 /// TLACITKA ///
 int keyNow, keyPrev, keyLast, keyState;
@@ -353,22 +356,25 @@ void setup() {
   lcd->createChar(1, stupen); // ulozi do LCD symbol stupnu
   lcd->backlight(); // zapni podsvetleni (noBacklight -vypni)
 
-  //----------------Test stisku tlacitka pro nastaveni vyroby------------
-  klavesa = KeyScan();
-  if (klavesa == KeyUp) {
-    delay(2000);
-    if (klavesa == KeyUp) {
-      showStatus = true;
-      nastaveni_kwh();
-    }
-  }
-  //---------------------------------------------------------------------
   lcd->setCursor(0, 0);
   lcd->print(" SOLAR INVERTER ");
   lcd->setCursor(0, 1);
   lcd->print("    SITON 210   ");
-  delay(2500);
-  wdt_reset(); //reset watchdogu
+
+  //----------------Test stisku tlacitka pro nastaveni vyroby------------
+  timStart = millis();
+  keyUpCnt = 0;
+  while (millis() - timStart < 2500) {
+    if (KeyScan() == KeyUp) keyUpCnt++;
+    if (keyUpCnt == 4) {
+      showStatus = true;
+      nastaveni_kwh();
+      break;
+    }
+    wdt_reset(); //reset watchdogu
+  }
+  //---------------------------------------------------------------------
+
   lcd->clear();
   lcd->setCursor(0, 0);
   lcd->print(" Tomas Nevrela  ");
@@ -378,9 +384,9 @@ void setup() {
   wdt_reset(); //reset watchdogu
   lcd->clear();
   lcd->setCursor(0, 0);
-  lcd->print(" fork24 v5.8    ");
+  lcd->print(" fork24 v5.9    ");
   lcd->setCursor(0, 1);
-  lcd->print(" JS 07/2025     ");
+  lcd->print(" JS 09/2025     ");
   delay(2000);
 
   // nastavit offsetA
@@ -502,7 +508,6 @@ void loop() {
   if (showStatus)mainMenu();
   if (!digitalRead(enable_pin)) //proved pokud je povolen provoz menice na vstupu enable
   {
-
     if (klavesa == KeyUp)
     {
       strida += 5;
@@ -518,7 +523,6 @@ void loop() {
       timRuc = millis();
     }
     if (strida < 8) strida = 8;
-
   }
 }
 //==========================konec hlavni smycky=================================
@@ -881,12 +885,18 @@ void zobrazeni()
     lcd->print(napeti);
     lcd->print("V ");
 
-    lcd->setCursor(5, 0);
-    if (proud < 1000) lcd->print(" ");
-    lcd->print(proud / 100);
-    lcd->print(".");
-    lcd->print((proud % 100) / 10);
-    lcd->print("A ");
+		if (digitalRead(enable_pin)) {
+			lcd->print("STOP E");
+    } else if (TeplBojl >= teplotaMax) {
+      lcd->print("STOP T");
+		}	else {
+      lcd->setCursor(5, 0);
+      if (proud < 1000) lcd->print(" ");
+      lcd->print(proud / 100);
+      lcd->print(".");
+      lcd->print((proud % 100) / 10);
+      lcd->print("A ");
+    }
 
     lcd->setCursor(11, 0);
     if (vykon < 1000 && vykon > 99) lcd->print(" ");
