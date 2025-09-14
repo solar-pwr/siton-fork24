@@ -68,6 +68,7 @@
       - odstraneni EEPROMAnything.h (EEPROM.h umi totez)
   5.9 - BUGFIX: nefunkcni nastaveni kWh po zapnuti
       - indikace "STOP E" / "STOP T" jako ve verzi 8.x
+  5.10 - BUGFIX: kolisani vykonu do zapornych hodnot pri nulovem odberu
 */
 
 #include <SoftEasyTransfer.h> //https://github.com/madsci1016/Arduino-SoftEasyTransfer
@@ -384,7 +385,7 @@ void setup() {
   wdt_reset(); //reset watchdogu
   lcd->clear();
   lcd->setCursor(0, 0);
-  lcd->print(" fork24 v5.9    ");
+  lcd->print(" fork24 v5.10   ");
   lcd->setCursor(0, 1);
   lcd->print(" JS 09/2025     ");
   delay(2000);
@@ -652,9 +653,9 @@ void mereni()
   // vypocet proudu
   rawProud = koefProud * sumA;
   fProud = (rawProud - offsetA) * (1 + 0.001 * kalibA);
+  if (fProud <= 9) fProud = 0;
   proud = fProud;
 
-  if (proud <= 9) proud = 0;//kalibrace 0
   nadproud = proud >= Maxproud;
 
   // vypocet napeti
