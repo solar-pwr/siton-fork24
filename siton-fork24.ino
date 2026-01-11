@@ -69,6 +69,7 @@
   5.9 - BUGFIX: nefunkcni nastaveni kWh po zapnuti
       - indikace "STOP E" / "STOP T" jako ve verzi 8.x
   5.10 - BUGFIX: kolisani vykonu do zapornych hodnot pri nulovem odberu
+  5.11 - vynulovani pocitadla nadproudove ochrany po 10 minutach
 */
 
 #include <SoftEasyTransfer.h> //https://github.com/madsci1016/Arduino-SoftEasyTransfer
@@ -112,7 +113,7 @@ int nodeID = 12; // cislo Emon nodu
 #define INTERVAL_WR 3600000 //interval zapisu vyroby - 60 min.
 #define INTERVAL_RUC 10000 //cas prepnuti z rucniho zpet do aut. rezimu v ms
 #define INTERVAL_KOM 3000 // perioda odesilani dat v ms
-unsigned long timNow, timMppt, timKey, timVA, timWR, timRuc, timKom, timDisp, timLed, timVyroba, timStart;
+unsigned long timNow, timMppt, timKey, timVA, timWR, timRuc, timKom, timDisp, timLed, timVyroba, timStart, timOchrana;
 int keyUpCnt;
 
 /// TLACITKA ///
@@ -385,9 +386,9 @@ void setup() {
   wdt_reset(); //reset watchdogu
   lcd->clear();
   lcd->setCursor(0, 0);
-  lcd->print(" fork24 v5.10   ");
+  lcd->print(" fork24 v5.11   ");
   lcd->setCursor(0, 1);
-  lcd->print(" JS 09/2025     ");
+  lcd->print(" JS 10/2025     ");
   delay(2000);
 
   // nastavit offsetA
@@ -418,6 +419,7 @@ void loop() {
     //------------------pusobeni nadproudove ochrany---------------------------------
 
     if (ochrana) {
+      timOchrana = millis();
       lcd->clear();
       lcd->setCursor(0, 0);// sloupec, radek
       lcd->print("  NADPROUDOVA  ");
@@ -452,6 +454,8 @@ void loop() {
         wdt_disable();
         while (1);
       }
+    } else {
+      if (millis() - timOchrana > 600000) restart = 0;
     }
   }
   //------------------------------------------------------------------------------
@@ -796,7 +800,7 @@ void rizeni()
 //==============================================================================
 //nucene projede VA krivku FV z min. do max. stridy, pokud najde vyssi vykon
 //nastavi stridu na tuto novou hodnotu
-void testVA ()
+void testVA()
 {
   int regIdx;
 
@@ -829,9 +833,9 @@ void testVA ()
         lcd->print("% ");
         //lcd->print(m);
         if (strida == 10)
-          delay(400); // cas na nabiti kondenzatoru
+          delay(1000); // cas na nabiti kondenzatoru
         else
-          delay(100);
+          delay(400);
         mereni();
         if (vykon > vykonMpp && veff > veffMpp)
         {
@@ -843,7 +847,7 @@ void testVA ()
           holdingdata[regIdx * 2 + 21] = napeti;
           holdingdata[regIdx * 2 + 22] = proud;
         }
-        m += 5;
+        m += 15;
         regIdx++;
       }
       vykon = vykonMpp;
@@ -854,7 +858,7 @@ void testVA ()
           holdingdata[regIdx * 2 + 22] = 0;
           regIdx++;
       }
-      if (holdingdata[20] < 100)
+      if (holdingdata[20] < 100) // counter
         holdingdata[20]++;
       else
         holdingdata[20] = 1;
