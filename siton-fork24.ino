@@ -70,6 +70,8 @@
       - indikace "STOP E" / "STOP T" jako ve verzi 8.x
   5.10 - BUGFIX: kolisani vykonu do zapornych hodnot pri nulovem odberu
   5.11 - vynulovani pocitadla nadproudove ochrany po 10 minutach
+  5.12 - BUGFIX: zkraceni pole holdingdata - nedostatek pameti
+         pri startu na Atmega328PB
 */
 
 #include <SoftEasyTransfer.h> //https://github.com/madsci1016/Arduino-SoftEasyTransfer
@@ -217,7 +219,7 @@ PayloadTX emontx;   // vytvoreni instance
 SoftEasyTransfer ET;
 
 // pole dat pro modbus
-unsigned int holdingdata[200];
+uint16_t holdingdata[120];
 unsigned int cnt_sl;
 Modbus slave(nodeID, mySerial, TXenableRS485); // slave adresa,SoftwareSerial,RS485 enable pin
 
@@ -230,7 +232,7 @@ void setBacklight(int8_t backlight) {
   Wire.beginTransmission(0x25);
   Wire.write(backlight);
   Wire.endTransmission();
-  analogWrite(backlightPWMpin, ((10 - backlight) * 25) + 5);
+//  analogWrite(backlightPWMpin, ((10 - backlight) * 25) + 5);
 }
 
 int lcdCheck(int addr) {
@@ -248,6 +250,7 @@ void lcdInit(int addr) {
   } else {
     lcd = new LiquidCrystal_I2C(lcdAddr, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);
   }
+
   lcd->begin(16, 2);
   lcd->backlight();
   lcd->createChar(1, stupen);
@@ -347,9 +350,9 @@ void setup() {
   slave.setID(nodeID);// nastavi Modbus slave adresu
   delay(60);
 
-  if (lcdCheck(0x27)) 
-    lcdInit(0x27); 
-  else {
+  if (lcdCheck(0x27)) {
+    lcdInit(0x27);
+  } else {
     lcdInit(0x3f);
     if (!lcdCheck(0x3f)) lcdAddr = -1;
   }
@@ -386,9 +389,9 @@ void setup() {
   wdt_reset(); //reset watchdogu
   lcd->clear();
   lcd->setCursor(0, 0);
-  lcd->print(" fork24 v5.11   ");
+  lcd->print(" fork24 v5.12   ");
   lcd->setCursor(0, 1);
-  lcd->print(" JS 10/2025     ");
+  lcd->print(" JS 03/2026     ");
   delay(2000);
 
   // nastavit offsetA
@@ -590,7 +593,7 @@ void komunikace()
     holdingdata[18] = vykonMaxSts;
     holdingdata[19] = offsetA;
 
-    slave.poll( holdingdata, 200 );
+    slave.poll( holdingdata, 120 );
 
     if (cnt_sl != slave.getOutCnt()) {
       digitalWrite(LEDpin, HIGH);
